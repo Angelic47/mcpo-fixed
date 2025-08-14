@@ -3,6 +3,12 @@ import traceback
 from typing import Any, Dict, ForwardRef, List, Optional, Type, Union
 import logging
 from fastapi import HTTPException
+from anyio import ClosedResourceError
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
+from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 
 from mcp import ClientSession, types
 from mcp.types import (
@@ -264,7 +270,6 @@ def get_model_fields(form_model_name, properties, required_fields, schema_defs=N
 
     return model_fields
 
-
 def get_tool_handler(
     session,
     endpoint_name,
@@ -283,6 +288,76 @@ def get_tool_handler(
             endpoint_name: str, FormModel, session: ClientSession
         ):  # Parameterized endpoint
             async def tool(form_data: FormModel) -> Union[ResponseModel, Any]:
+                """
+                Restart MCP session and call tool
+
+                Args:
+                    server_type: MCP server type (stdio, sse, streamablehttp)
+                    args: Server arguments
+                    command: Command (only for stdio)
+                    env: Environment variables (only for stdio)
+                    endpoint_name: The name of the endpoint to call
+                    arguments: Call arguments
+
+                Returns:
+                    The result of the tool call
+                """
+                async def McpReCallTools(
+                    server_type: str,
+                    args: Union[str, List[str]],
+                    command: Optional[str],
+                    env: Dict[str, str],
+                    endpoint_name: str,
+                    arguments: Dict[str, Any]
+                ) -> Any:
+                    result = None
+
+                    if server_type == "stdio":
+                        server_params = StdioServerParameters(
+                            command=command,
+                            args=args,
+                            env={**env},
+                        )
+                        async with stdio_client(server_params) as (read_stream, write_stream):
+                            async with ClientSession(read_stream, write_stream) as session:
+                                # Initialize session
+                                await session.initialize()
+                                # Call tool
+                                result = await session.call_tool(endpoint_name, arguments=arguments)
+
+                    elif server_type == "sse" and args:
+                        # Use original URL to re-establish SSE connection
+                        url = args if isinstance(args, str) else args[0]
+                        logger.info(f"Re-establishing SSE connection, URL: {url}")
+                        async with sse_client(url=url) as (read_stream, write_stream):
+                            async with ClientSession(read_stream, write_stream) as session:
+                                # Initialize session
+                                await session.initialize()
+                                # Call tool
+                                result = await session.call_tool(endpoint_name, arguments=arguments)
+                                
+                    elif server_type == "streamablehttp" and args:
+                        # Use original URL to re-establish Streamable HTTP connection
+                        url = args if isinstance(args, str) else args[0]
+                        logger.info(f"Re-establishing Streamable HTTP connection, URL: {url}")
+                        async with streamablehttp_client(url) as (read_stream, write_stream, _):
+                            async with ClientSession(read_stream, write_stream) as session:
+                                # Initialize session
+                                await session.initialize()
+                                # Call tool
+                                result = await session.call_tool(endpoint_name, arguments=arguments)
+
+                    if result:
+                        logger.info(f"Calling endpoint: {endpoint_name}, with args: {arguments} result: {result}")
+                        response_data = process_tool_response(result)
+                        final_response = (response_data[0] if len(response_data) == 1 else response_data)
+                        return final_response
+
+                    # If failed to reconnect and get result, return error
+                    raise HTTPException(
+                        status_code=500,
+                        detail={"message": f"Failed to reconnect and call {endpoint_name}"},
+                    )
                 args = form_data.model_dump(exclude_none=True, by_alias=True)
                 logger.info(f"Calling endpoint: {endpoint_name}, with args: {args}")
                 try:
@@ -312,6 +387,24 @@ def get_tool_handler(
                     logger.info(
                         f"MCP Error calling {endpoint_name}: {traceback.format_exc()}"
                     )
+                    if e.error.message == 'Session terminated' and hasattr(session, 'context') and 'request' in session.context:
+                        logger.info("Session terminated, trying to restart")
+                        request = session.context['request']
+                        app = getattr(request, "app", None)
+                        server_type = getattr(app.state, "server_type", "stdio")
+                        mcp_args = getattr(app.state, "args", [])
+                        command = getattr(app.state, "command", None)
+                        env = getattr(app.state, "env", {})
+
+                        return await McpReCallTools(
+                            server_type=server_type, 
+                            args=mcp_args, 
+                            command=command, 
+                            env=env, 
+                            endpoint_name=endpoint_name, 
+                            arguments=mcp_args
+                        )
+                    
                     status_code = MCP_ERROR_TO_HTTP_STATUS.get(e.error.code, 500)
                     raise HTTPException(
                         status_code=status_code,
@@ -321,13 +414,37 @@ def get_tool_handler(
                             else {"message": e.error.message}
                         ),
                     )
+                
                 except Exception as e:
-                    logger.info(
-                        f"Unexpected error calling {endpoint_name}: {traceback.format_exc()}"
-                    )
+                    if isinstance(e, ClosedResourceError):
+                        logger.warning(f"Connection closed error: {str(e)}, retrying...")
+                        if hasattr(session, 'context') and 'request' in session.context:
+                            request = session.context['request']
+                            app = getattr(request, "app", None)
+                            server_type = getattr(app.state, "server_type", "stdio")
+                            mcp_args = getattr(app.state, "args", [])
+                            command = getattr(app.state, "command", None)
+                            env = getattr(app.state, "env", {})
+
+                            return await McpReCallTools(
+                                server_type=server_type,
+                                args=mcp_args,
+                                command=command,
+                                env=env,
+                                endpoint_name=endpoint_name,
+                                arguments=mcp_args
+                            )
+                    error_traceback = traceback.format_exc()
+                    logger.info(f"Unexpected error calling {endpoint_name}: {e}")
+                    logger.info(f"Error traceback: {error_traceback}")
                     raise HTTPException(
                         status_code=500,
-                        detail={"message": "Unexpected error", "error": str(e)},
+                        detail={
+                            "message": "Unexpected error during tool call",
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                            "traceback": error_traceback
+                        }
                     )
 
             return tool
